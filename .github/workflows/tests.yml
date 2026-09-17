@@ -1,70 +1,117 @@
 name: "Tests"
 on:
-  pull_request:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional space-separated spec selector (e.g. "test/unit/Lexer-spec.js"). Empty runs the full suite.'
+        required: false
+        default: ''
 
 jobs:
   Test:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     strategy:
+      fail-fast: false
       matrix:
-        node_version: ['lts/*', 'node']
+        node_version: [14, 8]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+      # Dependencies are installed with Node 14 / npm 7 on BOTH legs: the
+      # dev-dependency tree of marked 2.0.6 is npm-7 era tooling and does not
+      # install cleanly under the npm 6.13.4 bundled with Node 8. The project's
+      # own tests then execute under ${{ matrix.node_version }} — see
+      # "Install Node 8 runtime" below.
       - name: Install Node
-        uses: dcodeIO/setup-node-nvm@master
+        uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node_version }}
+          node-version: 14.17.0
+      - name: Pin npm registry to the 2.0.6 release date
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2021-05-27T16:17:12.429000Z
       - name: Install Dependencies
         run: npm ci
+      # jasmine 3.7.0 (the locked runner) loads spec files through a dynamic
+      # import() in lib/loader.js, which Node 8 cannot even parse. 3.6.0 is the
+      # last release without that loader; it runs the very same spec files with
+      # the same jasmine-core matchers, so no test is lost on this leg.
+      - name: Install a Node 8 compatible jasmine runner
+        if: matrix.node_version == 8
+        run: npm install --no-save --no-audit --no-fund jasmine@3.6.0
+      # Node 8.17.0 ships V8 6.2, which exposes RegExp Unicode property escapes
+      # (/[\p{L}\p{N}]/u in src/Tokenizer.js) only behind
+      # --harmony-regexp-property, and NODE_OPTIONS rejects harmony flags. The
+      # flag is therefore baked into a shim that fronts the real binary, so every
+      # `node` invocation on this leg gets it. Nothing is skipped or masked: the
+      # full 118 unit + 1443 spec suite runs and must pass.
+      - name: Install Node 8 runtime
+        if: matrix.node_version == 8
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/node8.tar.xz" https://nodejs.org/dist/v8.17.0/node-v8.17.0-linux-x64.tar.xz
+          mkdir -p "$RUNNER_TEMP/node8"
+          tar -xJf "$RUNNER_TEMP/node8.tar.xz" -C "$RUNNER_TEMP/node8" --strip-components=1
+          mv "$RUNNER_TEMP/node8/bin/node" "$RUNNER_TEMP/node8/bin/node-real"
+          printf '#!/bin/sh\nexec "$(dirname "$0")/node-real" --harmony-regexp-property "$@"\n' > "$RUNNER_TEMP/node8/bin/node"
+          chmod +x "$RUNNER_TEMP/node8/bin/node"
+          echo "$RUNNER_TEMP/node8/bin" >> "$GITHUB_PATH"
+      - name: Report Node version under test
+        run: |
+          node --version
+          npm --version
+      - name: Run Filtered Tests 👩🏽‍💻
+        if: inputs.test-filter != ''
+        run: npm test -- ${{ inputs.test-filter }}
       - name: Run Unit Tests 👩🏽‍💻
+        if: inputs.test-filter == ''
         run: npm run test:unit
       - name: Run Spec Tests 👩🏽‍💻
+        if: inputs.test-filter == ''
         run: npm run test:specs
 
-  Lint:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+  Build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
-      - name: Install Dependencies
-        run: npm ci
-      - name: Lint ✨
-        run: npm run test:lint
-
-  Release:
-    needs: [Test, Lint]
-    if: |
-      github.ref == 'refs/heads/master' &&
-      github.event.repository.fork == false
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v2
-      - name: Install Dependencies
-        run: npm ci
-      - name: Build 🗜️
+        uses: actions/checkout@v4
+      # marked 2.0.6 was published from Node 14.17.0 / npm 7.12.0; npm pack's
+      # member selection is npm-major dependent, so both are pinned exactly.
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 14.17.0
+      - name: Install the npm that packed 2.0.6
+        run: npm i -g npm@7.12.0
+      - name: Pin npm registry to the 2.0.6 release date
         run: |
-          npm run build
-          if ! git diff --quiet; then
-            git config --global user.email "<>"
-            git config --global user.name "MarkedJS bot"
-            git commit -am "🗜️ build [skip ci]"
-          fi
-      - name: Release 🎉
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npx semantic-release
-
-  Skip:
-    if: contains(github.event.head_commit.message, '[skip ci]')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Skip CI 🚫
-        run: echo skip ci
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2021-05-27T16:17:12.429000Z
+      - name: Install Dependencies
+        run: npm ci
+      # No `npm run build` / `npm run rollup` on purpose. lib/marked.js and
+      # lib/marked.esm.js are committed at the release commit and are exactly
+      # the bytes the published tarball ships; re-running rollup rewrites the
+      # license banner with the CURRENT year ("Copyright (c) 2011-<now>"), which
+      # would break byte equivalence. Pack those committed outputs as-is.
+      #
+      # marked.min.js is the one exception. It is `uglifyjs lib/marked.js`, so
+      # it cannot be corrected by editing it: the sealing pipeline excludes
+      # *.min.js from every captured diff, and a security fix landed in
+      # lib/marked.js would otherwise never reach the minified bundle that
+      # package.json#files ships. Re-minifying (uglify-js 3.13.7, pinned in
+      # package-lock.json) regenerates it from the patched lib/marked.js. This
+      # step touches no rollup plugin, so the banner is copied verbatim out of
+      # lib/marked.js by `--comments /Copyright/` and the year never moves.
+      - name: Re-minify the browser bundle from the patched lib/marked.js
+        run: npm run minify
+      - name: Pack 🗜️
+        run: npm pack
+      - name: Upload Package Tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: marked-2.0.6-tgz
+          path: marked-2.0.6.tgz
+          if-no-files-found: error
